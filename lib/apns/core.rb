@@ -9,6 +9,9 @@ module APNS
   @pem = nil # this should be the path of the pem file not the contentes
   @pass = nil
 
+  SELECT_TIMEOUT = 10
+  ERROR_TUPLE_BYTES = 6
+
   class << self
     attr_accessor :host, :pem, :port, :pass
   end
@@ -20,13 +23,41 @@ module APNS
 
   def self.send_notifications(notifications)
     sock, ssl = self.open_connection
+    errors = []
 
     packed_nofications = self.packed_nofications(notifications)
 
-    ssl.write(packed_nofications)
+    begin
+      ssl.write(packed_nofications)
+
+      error = self.check_errors(ssl)
+
+      break unless error
+
+      ssl.close
+      sock.close
+      sock, ssl = self.open_connection
+      error_index = notifications.index{|i| i.message_identifier.unpack("N")[0] == error.notification_id}
+
+      break unless error_index
+      error.device_token = notifications[error_index].device_token
+      errors << error
+      notifications = notifications[(error_index + 1)..-1]
+      packed_nofications = self.packed_nofications(notifications)
+    end while notifications.any?
 
     ssl.close
     sock.close
+    errors
+  end
+
+  def self.check_errors(ssl)
+    if IO.select([ssl], nil, nil, APNS::SELECT_TIMEOUT) # timeout
+      if tuple = ssl.read(APNS::ERROR_TUPLE_BYTES)
+        _, code, notification_id = tuple.unpack("ccN")
+        APNS::Error.new(code, notification_id)
+      end
+    end
   end
 
   def self.packed_nofications(notifications)
